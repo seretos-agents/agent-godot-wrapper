@@ -283,7 +283,7 @@ Describe 'prepare-godot-worktree.ps1 R5: -EnableAddon' {
         $pg = Get-Content -Raw $pgPath
         ([regex]::Matches($pg, [regex]::Escape('res://addons/godot_mcp_toolkit/plugin.cfg'))).Count | Should -Be 1
         ([regex]::Matches($pg, '(?m)^\[editor_plugins\]')).Count | Should -Be 1
-        $pg | Should -Match 'PackedStringArray\('
+        $pg | Should -Match '(?m)^enabled=PackedStringArray\([^)]*"res://addons/godot_mcp_toolkit/plugin\.cfg"[^)]*\)\s*$'
     }
 
     It 'end to end: pwsh -File ... -EnableAddon twice leaves one enable entry' -Skip:$script:godotRunning {
@@ -305,6 +305,7 @@ Describe 'prepare-godot-worktree.ps1 R5: -EnableAddon' {
         ([regex]::Matches($pg, [regex]::Escape('res://addons/godot_mcp_toolkit/plugin.cfg'))).Count | Should -Be 1
         ([regex]::Matches($pg, '(?m)^\[editor_plugins\]')).Count | Should -Be 1
         ([regex]::Matches($pg, '(?m)^enabled=')).Count | Should -Be 1
+        $pg | Should -Match '(?m)^enabled=PackedStringArray\("res://addons/other/plugin\.cfg",\s*"res://addons/godot_mcp_toolkit/plugin\.cfg"\)\s*$'
     }
 
     It 'guard: leaves project.godot untouched and warns while a godot process runs' {
@@ -412,7 +413,10 @@ Describe 'Live: per-environment Godot editor' -Tag Live {
         (Invoke-BridgeTool -Checkout $p -Tool 'game_start') | Should -Match 'HEADLESS_UNSUPPORTED'
         Invoke-LiveStep -Checkout $p -StepName $null -Section 'Stop' | Out-Null
         (Invoke-LiveStep -Checkout $p -StepName 'gui' -Section 'Start').ExitCode | Should -Be 0
-        (Invoke-BridgeTool -Checkout $p -Tool 'game_start') | Should -Not -Match 'HEADLESS_UNSUPPORTED'
+        $guiResp = Invoke-BridgeTool -Checkout $p -Tool 'game_start'
+        $guiResp | Should -Not -BeNullOrEmpty
+        $guiResp | Should -Match '"result"'
+        $guiResp | Should -Not -Match '"error"|"isError"\s*:\s*true|HEADLESS_UNSUPPORTED'
         Invoke-BridgeTool -Checkout $p -Tool 'game_stop' | Out-Null
     }
 }
