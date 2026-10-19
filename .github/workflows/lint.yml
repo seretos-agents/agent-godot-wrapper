@@ -1,0 +1,119 @@
+name: lint
+
+# Runs on every pull request only -- not on push. A push-triggered run on
+# the same branch as an open PR would duplicate the PR run (both fire for
+# the same commit), so PRs are the sole trigger. main is protected, so a
+# PR is the only way a change lands there anyway.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate plugin.json is valid JSON
+        run: |
+          jq empty .claude-plugin/plugin.json
+          jq empty .codex-plugin/plugin.json
+
+      # The wrapped MCP bridge is pinned to an exact npm version in BOTH
+      # manifests so npx reuses one cached package. A drift between them would
+      # silently give Claude and Codex different servers - and SKILL.md
+      # documents one tool inventory.
+      - name: Validate the godot-mcp-server pin matches across manifests
+        run: |
+          CLAUDE_PIN=$(jq -r '.mcpServers.godotMCP.args[-1]' .claude-plugin/plugin.json)
+          CODEX_PIN=$(jq -r '.mcpServers.godotMCP.args[-1]' .codex-plugin/plugin.json)
+          echo "claude: $CLAUDE_PIN / codex: $CODEX_PIN"
+          case "$CLAUDE_PIN" in
+            @npgamedev/godot-mcp-server@[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Pin '$CLAUDE_PIN' must be an exact @npgamedev/godot-mcp-server@X.Y.Z pin"; exit 1 ;;
+          esac
+          if [ "$CLAUDE_PIN" != "$CODEX_PIN" ]; then
+            echo "::error::Manifest pins differ: '$CLAUDE_PIN' vs '$CODEX_PIN'"
+            exit 1
+          fi
+          echo "Pin check: OK"
+
+      # The bridge resolves the editor it should talk to by matching a project
+      # path against the toolkit's machine-wide registry. On Claude that path
+      # is passed explicitly via ${CLAUDE_PROJECT_DIR}; Codex has no such
+      # variable, so its manifest must NOT reference it (it would arrive as an
+      # unexpanded literal and match no registry entry) - the bridge falls
+      # back to process.cwd() there, which Codex sets to the project root.
+      - name: Validate the project-path wiring is host-appropriate
+        run: |
+          CLAUDE_PATH=$(jq -r '.mcpServers.godotMCP.env.GODOT_MCP_PROJECT_PATH // empty' .claude-plugin/plugin.json)
+          if [ "$CLAUDE_PATH" != '${CLAUDE_PROJECT_DIR}' ]; then
+            echo "::error::.claude-plugin/plugin.json must set mcpServers.godotMCP.env.GODOT_MCP_PROJECT_PATH to '\${CLAUDE_PROJECT_DIR}' (got '$CLAUDE_PATH')"; exit 1
+          fi
+          if grep -q 'CLAUDE_PROJECT_DIR' .codex-plugin/plugin.json; then
+            echo "::error::.codex-plugin/plugin.json must not reference \${CLAUDE_PROJECT_DIR} - Codex does not expand it. See AGENTS.md."; exit 1
+          fi
+          echo "Project-path wiring: OK"
+
+      - name: Validate SKILL.md has YAML frontmatter for every skill
+        run: |
+          python3 - <<'EOF'
+          import glob, re, sys
+          paths = sorted(glob.glob("skills/*/SKILL.md"))
+          if not paths:
+              print("::error::no SKILL.md files found under skills/*/SKILL.md")
+              sys.exit(1)
+          ok = True
+          for path in paths:
+              text = open(path, encoding="utf-8").read()
+              m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+              if not m:
+                  print(f"::error::{path}: missing YAML frontmatter")
+                  ok = False
+                  continue
+              fm = m.group(1)
+              if "name:" not in fm or "description:" not in fm:
+                  print(f"::error::{path}: frontmatter missing 'name' or 'description'")
+                  ok = False
+                  continue
+              print(f"{path}: OK")
+          if not ok:
+              sys.exit(1)
+          EOF
+
+      # Claude Code silently ignores a CRLF skill/instruction file. The
+      # .gitattributes LF default guards checkouts; this guards the blobs.
+      - name: Validate no tracked text file contains CR bytes
+        run: |
+          if git ls-files -z | xargs -0 grep -lI $'\r' -- 2>/dev/null; then
+            echo "::error::CRLF line endings found in the files listed above."
+            exit 1
+          fi
+          echo "Line endings: OK"
+
+  # release.yml's changelog scripts are plain bash invoked via an explicit
+  # bash.exe on Windows -- this job proves them on both platforms release.yml
+  # actually runs under. `validate` above stays ubuntu-only with no Python,
+  # so this is a separate job rather than an extra step there.
+  release-scripts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python -m pip install pytest
+
+      - name: Run release-script driving tests
+        run: python -m pytest tests/test_release_scripts.py -v

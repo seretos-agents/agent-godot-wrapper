@@ -1,0 +1,10 @@
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+.process-ticket-result.json
+__pycache__/
+*.pyc
+.pytest_cache/
+.adev/
