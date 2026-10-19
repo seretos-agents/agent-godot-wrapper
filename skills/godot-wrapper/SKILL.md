@@ -256,11 +256,25 @@ editor binary other than `--check-only` — including a headless `--script` test
 also starts the runtime channel. Set `GODOT_MCP_RUNTIME=0` on such runs so they do not
 steal the runtime slot from the game the agent started.
 
-**Launch automation is an open item.** Unlike `agent-unity-wrapper`, this plugin does not
-yet ship a prepare-script that writes an `environment_start`/`environment_stop`
-(`agent-worktree`) `start:`/`stop:` block, nor a Godot binary resolution convention. Until
-it does, the user starts the editor; the command above is what such a `start:` step would
-run.
+**Per-environment boot (`agent-worktree`).** Run `scripts/prepare-godot-worktree.ps1`
+(from this plugin) once at the root of the Godot project repo and commit the result. It
+writes `.seretos/worktree-setup.yml` (only if absent; never rewritten) with `isolation:
+full`, two `start:` variants and one `stop:` step, plus a generated, always-overwritten
+`.seretos/godot-mcp-launch.ps1`, and adds `.godot-mcp/` to `.gitignore`. Then
+`environment_start` boots an editor for that checkout and `environment_stop` kills it:
+
+- `variant: default` = headless (`--headless --editor`), for unattended work; `variant: gui`
+  = windowed editor, needed for `game_start` playtests and screenshots.
+- The editor binary is `$env:GODOT_EDITOR_PATH`, else `godot` / `godot4` on `PATH`; with
+  neither, the step fails telling you to set `GODOT_EDITOR_PATH`.
+- Readiness: the step waits (default 120 s) for the `[MCPServer] listening on ...` line in
+  `.godot-mcp/editor.log`, or on Windows a fresh registry entry for the checkout. On
+  timeout it fails and keeps `.godot-mcp/godot.pid`; call `environment_stop` to clean up.
+- A second start on a checkout whose recorded editor is alive does nothing (one editor per
+  directory). Stop is a silent no-op when nothing is recorded.
+- `-EnableAddon` (opt-in) adds the addon to `project.godot`'s `[editor_plugins]` list; it
+  is skipped with a warning while any `godot*` process is running.
+- The addon itself must still be installed in the project; the script only warns if absent.
 
 ### Pinning ports (parallel test harnesses only)
 

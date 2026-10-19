@@ -117,3 +117,24 @@ jobs:
 
       - name: Run release-script driving tests
         run: python -m pytest tests/test_release_scripts.py -v
+
+  # The prepare-script's stop logic has OS-specific branches (taskkill vs kill)
+  # and the stand-in processes are real, so this runs on both platforms.
+  # Advisory like release-scripts; the Live tests (real editor) never run here.
+  pester:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.5 -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Run prepare-godot-worktree tests
+        shell: pwsh
+        run: Invoke-Pester -Path tests/prepare-godot-worktree.Tests.ps1 -ExcludeTag Live -CI -Output Detailed
