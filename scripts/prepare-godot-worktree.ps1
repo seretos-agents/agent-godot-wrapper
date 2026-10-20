@@ -20,25 +20,39 @@
       fix reaches already-prepared repos the next time this script runs.
     * `.gitignore` - `.godot-mcp/` (pid file + editor log) is appended if missing.
 
-  Warns (never fails) when `project.godot` or `addons/godot_mcp_toolkit/plugin.cfg`
-  is missing: the addon is installed by the user, not by this script.
-
-  -EnableAddon (opt-in) adds `res://addons/godot_mcp_toolkit/plugin.cfg` to
-  `project.godot`'s `[editor_plugins] enabled=PackedStringArray(...)`. It is skipped
-  with a warning while any godot* process is running (never edit project.godot under
-  a running editor).
+  Also installs and enables the Godot MCP Toolkit addon (needs a `project.godot`;
+  without one the addon step warns and is skipped):
+    * `addons/godot_mcp_toolkit/` is installed from the toolkit release zip at the
+      pinned version (`$script:ToolkitVersion`, 1.0.4 - the version matching the
+      bridge pinned in the plugin manifests). An addon already at that version is
+      never touched (no download, no write). An addon at ANOTHER version is left
+      byte-identical, warned about (both versions named) and NOT enabled; delete
+      `addons/godot_mcp_toolkit/` and re-run to replace it.
+    * `res://addons/godot_mcp_toolkit/plugin.cfg` is added to `project.godot`'s
+      `[editor_plugins] enabled=PackedStringArray(...)`. That edit is skipped with a
+      warning while any godot* process is running (never edit project.godot under a
+      running editor); the addon files are still installed then.
 
 .PARAMETER RepoRoot
   Repo to prepare. Defaults to `git rev-parse --show-toplevel`, else the cwd.
 
-.PARAMETER EnableAddon
-  Also add the addon to project.godot's enabled editor plugins.
+.PARAMETER AddonSource
+  Where to get the addon zip: an http(s) URL (default: the pinned GitHub release
+  asset) or the path of a local zip (a missing path is an error, never a fallback to
+  the network). Only read when the addon is absent.
 #>
 [CmdletBinding()]
 param(
     [string]$RepoRoot,
-    [switch]$EnableAddon
+    [string]$AddonSource
 )
+
+# Addon version to install. The bridge (@npgamedev/godot-mcp-server) is versioned
+# independently upstream, so this is NOT derived from the manifests: re-check it
+# whenever the bridge pin in plugin.json is bumped.
+$script:ToolkitVersion = '1.0.4'
+$script:ToolkitUrl = "https://github.com/NPGameDev/godot-mcp-toolkit/releases/download/v$($script:ToolkitVersion)/godot-mcp-toolkit-$($script:ToolkitVersion).zip"
+if (-not $AddonSource) { $AddonSource = $script:ToolkitUrl }
 
 $ErrorActionPreference = 'Stop'
 
@@ -64,7 +78,7 @@ function Enable-GodotAddon {
     if ($text.Contains($entry)) { return }
 
     if (Get-Process -Name 'godot*' -ErrorAction SilentlyContinue) {
-        Write-Warning "[prepare-godot-worktree] A godot process is running - not editing project.godot under a running editor. Close the editor and re-run with -EnableAddon, or enable the addon under Project Settings -> Plugins."
+        Write-Warning "[prepare-godot-worktree] A godot process is running - not editing project.godot under a running editor. Close the editor and re-run this script, or enable the addon under Project Settings -> Plugins."
         return
     }
 
@@ -83,6 +97,87 @@ function Enable-GodotAddon {
     }
     Write-Utf8NoBom -Path $ProjectGodotPath -Content $text
     Write-Host "[prepare-godot-worktree] Enabled the Godot MCP Toolkit addon in project.godot."
+}
+
+# Returns the version="..." of an addon plugin.cfg, or $null.
+function Get-AddonCfgVersion {
+    param([string]$CfgPath)
+    if (-not (Test-Path -LiteralPath $CfgPath)) { return $null }
+    $m = [regex]::Match([System.IO.File]::ReadAllText($CfgPath), '(?m)^version\s*=\s*"([^"]*)"')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ''
+}
+
+# Installs addons/godot_mcp_toolkit at the pinned version. Returns $true when the
+# addon at the pinned version is present afterwards, $false when another version was
+# left in place. Throws on a bad/missing source or an archive at the wrong version.
+function Install-GodotAddon {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Source
+    )
+    $pin = $script:ToolkitVersion
+    $dest = Join-Path $RepoRoot 'addons/godot_mcp_toolkit'
+    $have = Get-AddonCfgVersion (Join-Path $dest 'plugin.cfg')
+    if ($null -ne $have) {
+        if ($have -eq $pin) {
+            Write-Info "Godot MCP Toolkit addon already at $pin - left untouched."
+            return $true
+        }
+        Write-Warning "[prepare-godot-worktree] addons/godot_mcp_toolkit is at version '$have', expected ${pin} - left untouched and NOT enabled. Delete addons/godot_mcp_toolkit/ and re-run to replace it."
+        return $false
+    }
+    if (Test-Path -LiteralPath $dest) {
+        throw "addons/godot_mcp_toolkit exists without a readable plugin.cfg; delete it and re-run."
+    }
+
+    $isUrl = $Source -match '^https?://'
+    if (-not $isUrl -and -not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        throw "Addon source not found: ${Source}"
+    }
+
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('pgw-addon-' + [System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    try {
+        $zip = $Source
+        if ($isUrl) {
+            try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+            $zip = Join-Path $work 'addon.zip'
+            Write-Info "Downloading $Source"
+            Invoke-WebRequest -Uri $Source -OutFile $zip -UseBasicParsing
+        }
+        $ex = Join-Path $work 'x'
+        Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force
+        $cfgs = @(Get-ChildItem -LiteralPath $ex -Recurse -File -Filter plugin.cfg |
+            Where-Object { ($_.FullName -replace '\\', '/') -match '/addons/godot_mcp_toolkit/plugin\.cfg$' })
+        if ($cfgs.Count -ne 1) { throw "Addon archive does not contain exactly one addons/godot_mcp_toolkit/plugin.cfg (found $($cfgs.Count)): ${Source}" }
+        $got = Get-AddonCfgVersion $cfgs[0].FullName
+        if ($got -ne $pin) { throw "Addon archive is version '$got', expected ${pin}: ${Source}" }
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+        Copy-Item -LiteralPath $cfgs[0].DirectoryName -Destination $dest -Recurse
+        Write-Info "Installed Godot MCP Toolkit addon $pin into addons/godot_mcp_toolkit."
+        return $true
+    } finally {
+        Remove-Item -Recurse -Force -LiteralPath $work -ErrorAction SilentlyContinue
+    }
+}
+
+# Default-run addon step: install, then enable (guarded) when the pinned version is there.
+function Initialize-GodotAddon {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Source
+    )
+    $projectGodot = Join-Path $RepoRoot 'project.godot'
+    if (-not (Test-Path -LiteralPath $projectGodot)) {
+        Write-Warn2 "No 'project.godot' under repo root - skipping addon install and enable."
+        return
+    }
+    if (Install-GodotAddon -RepoRoot $RepoRoot -Source $Source) {
+        Enable-GodotAddon -ProjectGodotPath $projectGodot
+    }
 }
 
 # The managed start/stop block. Single-quoted here-string: NO interpolation - every
@@ -290,9 +385,6 @@ if ($MyInvocation.InvocationName -ne '.') {
     if (-not (Test-Path $projectGodot)) {
         Write-Warn2 "No 'project.godot' under repo root - this may not be a Godot project. Continuing anyway."
     }
-    if (-not (Test-Path (Join-Path $RepoRoot 'addons/godot_mcp_toolkit/plugin.cfg'))) {
-        Write-Warn2 "Godot MCP Toolkit addon not found at addons/godot_mcp_toolkit/ - install it (AssetLib or copy) and enable it under Project Settings -> Plugins."
-    }
 
     # 1. worktree-setup.yml: only when absent, never read.
     $ymlPath = Join-Path $RepoRoot '.seretos/worktree-setup.yml'
@@ -316,9 +408,6 @@ if ($MyInvocation.InvocationName -ne '.') {
         Write-Info 'Added .godot-mcp/ to .gitignore.'
     }
 
-    # 4. opt-in addon enable.
-    if ($EnableAddon) {
-        if (Test-Path $projectGodot) { Enable-GodotAddon -ProjectGodotPath $projectGodot }
-        else { Write-Warn2 'Cannot -EnableAddon: no project.godot.' }
-    }
+    # 4. addon: install at the pinned version, then enable.
+    Initialize-GodotAddon -RepoRoot $RepoRoot -Source $AddonSource
 }
