@@ -267,8 +267,21 @@ two `start:` variants and one `stop:` step, plus a generated, always-overwritten
 
 - `variant: default` = headless (`--headless --editor`), for unattended work; `variant: gui`
   = windowed editor, needed for `game_start` playtests and screenshots.
-- The editor binary is `$env:GODOT_EDITOR_PATH`, else `godot` / `godot4` on `PATH`; with
-  neither, the step fails telling you to set `GODOT_EDITOR_PATH`.
+- Editor binary, first match wins: `GODOT_PATH`, `GODOT_EDITOR_PATH`, `godot` / `godot4`
+  on `PATH`, else the provisioned build below. A variable that is set but does not name an
+  existing file makes the step fail naming that variable; it does not fall through.
+  - **Nothing configured, on Windows:** the first `environment_start` downloads the pinned
+    Godot `4.7.2-stable` win64 console build into
+    `%LOCALAPPDATA%\agent-godot-wrapper\godot\4.7.2-stable\`
+    (`Godot_v4.7.2-stable_win64_console.exe`), and every later start reuses it. So the
+    right first call is a plain `environment_start` with no `env` parameter: do not search
+    the disk for a Godot executable and do not pass one through `env`.
+  - **Another build:** the user sets `GODOT_PATH` to that editor executable in the
+    environment the session starts from.
+  - **Failures:** provisioning is Windows-only — elsewhere, or when `LOCALAPPDATA` is
+    unset, the step fails naming `GODOT_PATH`. An existing
+    `%LOCALAPPDATA%\agent-godot-wrapper\godot\4.7.2-stable\` without the exe also fails:
+    delete that directory and start again.
 - Readiness: the step waits (default 120 s) for the `[MCPServer] listening on ...` line in
   `.godot-mcp/editor.log`, or on Windows a fresh registry entry for the checkout. On
   timeout it fails and keeps `.godot-mcp/godot.pid`; call `environment_stop` to clean up.
@@ -318,9 +331,9 @@ plugin's manifests set no pins on purpose; put them in the launching environment
 
    b. **Addon present and enabled — the editor is down or not found.** The bridge
       resolves the editor from the registry per connect, and the registry is rewritten
-      whenever an editor (re)starts, so a failed call is recoverable in-session: open the
-      editor on the project (or wait for `[MCPServer] listening on 127.0.0.1:<port>`),
-      then **retry the same call**. If it still fails, reconnect the MCP server (`/mcp` →
+      whenever an editor (re)starts, so a failed call is recoverable in-session: start the
+      editor (`environment_start` on a checkout prepared by the script, or open it by hand)
+      or wait for `[MCPServer] listening on 127.0.0.1:<port>`, then **retry the same call**. If it still fails, reconnect the MCP server (`/mcp` →
       reconnect) — no session restart. The tool list is a **static** server-side
       definition for the always-on set: seeing the tools does not mean the editor is up,
       and a failing call does not mean the tool is missing. A connection error that
