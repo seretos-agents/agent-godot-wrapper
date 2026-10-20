@@ -14,7 +14,7 @@ This plugin ships **only skill content** — no binaries of its own. It wraps a 
 
 ### 2. Godot 4.2+ with the Godot MCP Toolkit addon
 
-The bridge is only half of the MCP. The other half is an **editor addon** that runs inside the target Godot project and opens a localhost WebSocket the bridge dials:
+The bridge is only half of the MCP. The other half is an **editor addon** that runs inside the target Godot project and opens a localhost WebSocket the bridge dials. `pwsh scripts/prepare-godot-worktree.ps1` (see below) can do steps 1 and 2 for you: it installs the addon at the version matching the pinned bridge (1.0.4) and enables it in `project.godot`; an addon already present at another version is left untouched, warned about and not enabled. By hand:
 
 1. In the Godot editor open the **AssetLib** tab, search "Godot MCP Toolkit", Download, Install (or extract a [GitHub release](https://github.com/NPGameDev/godot-mcp-toolkit/releases) into the project's `addons/` directory).
 2. Project Settings → Plugins → **Godot MCP Toolkit** → check **Active**.
@@ -33,7 +33,7 @@ Godot 4.5+ is recommended; C# projects need the mono (.NET) editor build. Commit
 
 Start Claude Code from the Godot project root (or a linked worktree of it) with the editor open on that same project. The bridge finds the editor through the toolkit's machine-wide registry, keyed by project path — no port or token to configure.
 
-Optional: to let `agent-worktree` boot a per-checkout editor (`environment_start`), run `pwsh scripts/prepare-godot-worktree.ps1` from this plugin once at your Godot repo root and commit the result; set `GODOT_EDITOR_PATH` to your editor binary (or put `godot` on `PATH`). See `skills/godot-wrapper/SKILL.md`.
+Optional: to let `agent-worktree` boot a per-checkout editor (`environment_start`), run `pwsh scripts/prepare-godot-worktree.ps1` from this plugin once at your Godot repo root (it also installs and enables the addon; the `project.godot` edit is skipped while a Godot editor is running) and commit the result; set `GODOT_EDITOR_PATH` to your editor binary (or put `godot` on `PATH`). See `skills/godot-wrapper/SKILL.md`.
 
 ## What the skill teaches
 

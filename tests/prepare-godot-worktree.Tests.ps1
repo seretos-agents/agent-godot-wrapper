@@ -43,10 +43,41 @@ BeforeAll {
         return $tmp
     }
 
+    # Builds a fixture addon archive: addons/godot_mcp_toolkit/{plugin.cfg,plugin.gd}.
+    # -TopFolder nests everything under one extra top-level folder (alternate zip layout).
+    function New-FixtureAddonZip {
+        param([string]$Version, [string]$GdContent = '# fixture', [switch]$TopFolder)
+        $base = Join-Path ([System.IO.Path]::GetTempPath()) ('pgw-zip-' + [System.IO.Path]::GetRandomFileName())
+        $tree = Join-Path $base 'tree'
+        $addon = Join-Path $tree 'addons/godot_mcp_toolkit'
+        if ($TopFolder) { $addon = Join-Path $tree 'godot-mcp-toolkit-pkg/addons/godot_mcp_toolkit' }
+        New-Item -ItemType Directory -Force -Path $addon | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $addon 'plugin.cfg'),
+            "[plugin]`n`nname=`"Godot MCP Toolkit`"`nscript=`"plugin.gd`"`nversion=`"$Version`"`n")
+        [System.IO.File]::WriteAllText((Join-Path $addon 'plugin.gd'), $GdContent)
+        $zip = Join-Path $base 'toolkit.zip'
+        Compress-Archive -Path (Join-Path $tree '*') -DestinationPath $zip
+        return $zip
+    }
+
+    # Sorted "relative path|sha256|mtime ticks" lines for every file under a directory.
+    function Get-TreeSnapshot {
+        param([string]$Dir)
+        $root = (Resolve-Path -LiteralPath $Dir).Path
+        @(Get-ChildItem -LiteralPath $root -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $rel = $_.FullName.Substring($root.Length)
+            '{0}|{1}|{2}' -f $rel, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash, $_.LastWriteTimeUtc.Ticks
+        })
+    }
+
+    # Always injects a local fixture archive (1.0.4 unless -AddonSource) so no run touches the network.
     function Invoke-Prepare {
-        param([string]$Root, [switch]$EnableAddon)
-        $a = @('-NoProfile', '-File', $script:scriptPath, '-RepoRoot', $Root)
-        if ($EnableAddon) { $a += '-EnableAddon' }
+        param([string]$Root, [string]$AddonSource)
+        if (-not $AddonSource) {
+            if (-not $script:zip104) { $script:zip104 = New-FixtureAddonZip -Version '1.0.4' }
+            $AddonSource = $script:zip104
+        }
+        $a = @('-NoProfile', '-File', $script:scriptPath, '-RepoRoot', $Root, '-AddonSource', $AddonSource)
         $out = & pwsh @a 2>&1 | Out-String
         return @{ Output = $out; ExitCode = $LASTEXITCODE }
     }
@@ -286,9 +317,9 @@ Describe 'prepare-godot-worktree.ps1 R5: -EnableAddon' {
         $pg | Should -Match '(?m)^enabled=PackedStringArray\([^)]*"res://addons/godot_mcp_toolkit/plugin\.cfg"[^)]*\)\s*$'
     }
 
-    It 'end to end: pwsh -File ... -EnableAddon twice leaves one enable entry' -Skip:$script:godotRunning {
-        Invoke-Prepare -Root $script:tmp -EnableAddon | Out-Null
-        Invoke-Prepare -Root $script:tmp -EnableAddon | Out-Null
+    It 'end to end: the default run twice leaves one enable entry' -Skip:$script:godotRunning {
+        Invoke-Prepare -Root $script:tmp | Out-Null
+        Invoke-Prepare -Root $script:tmp | Out-Null
         $pg = Get-Content -Raw (Join-Path $script:tmp 'project.godot')
         ([regex]::Matches($pg, [regex]::Escape('res://addons/godot_mcp_toolkit/plugin.cfg'))).Count | Should -Be 1
         ([regex]::Matches($pg, '(?m)^\[editor_plugins\]')).Count | Should -Be 1
@@ -320,6 +351,109 @@ Describe 'prepare-godot-worktree.ps1 R5: -EnableAddon' {
     }
 }
 
+Describe 'prepare-godot-worktree.ps1 A: addon install (ticket #4)' {
+    BeforeAll {
+        $script:zip104 = New-FixtureAddonZip -Version '1.0.4'
+        $script:enableRx = '(?m)^enabled=PackedStringArray\([^)]*"res://addons/godot_mcp_toolkit/plugin\.cfg"[^)]*\)\s*$'
+    }
+    BeforeEach { $script:tmp = New-TempGodotRepo }
+    AfterEach  { Remove-Item -Recurse -Force $script:tmp -ErrorAction SilentlyContinue }
+
+    # A1 - symptom: without the addon nothing binds a port (ECONNREFUSED 127.0.0.1:6550).
+    It 'A1: default run on empty addons/ installs addon 1.0.4 and enables it' -Skip:$script:godotRunning {
+        New-Item -ItemType Directory -Path (Join-Path $script:tmp 'addons') | Out-Null
+        $r = Invoke-Prepare -Root $script:tmp
+        $r.ExitCode | Should -Be 0
+        $cfg = Join-Path $script:tmp 'addons/godot_mcp_toolkit/plugin.cfg'
+        $cfg | Should -Exist
+        (Get-Content -Raw $cfg) | Should -Match '(?m)^version="1\.0\.4"'
+        (Join-Path $script:tmp 'addons/godot_mcp_toolkit/plugin.gd') | Should -Exist
+        $pg = Get-Content -Raw (Join-Path $script:tmp 'project.godot')
+        $pg | Should -Match $script:enableRx
+        ([regex]::Matches($pg, [regex]::Escape('res://addons/godot_mcp_toolkit/plugin.cfg'))).Count | Should -Be 1
+    }
+
+    It 'A1 (layout): a zip with a top-level folder installs identically' -Skip:$script:godotRunning {
+        $zip = New-FixtureAddonZip -Version '1.0.4' -TopFolder
+        $r = Invoke-Prepare -Root $script:tmp -AddonSource $zip
+        $r.ExitCode | Should -Be 0
+        (Get-Content -Raw (Join-Path $script:tmp 'addons/godot_mcp_toolkit/plugin.cfg')) | Should -Match '(?m)^version="1\.0\.4"'
+        (Join-Path $script:tmp 'addons/godot_mcp_toolkit/plugin.gd') | Should -Exist
+        (Join-Path $script:tmp 'addons/godot_mcp_toolkit/godot-mcp-toolkit-pkg') | Should -Not -Exist
+    }
+
+    # A2 - the addon at the right version is never touched, and the source is never resolved.
+    It 'A2: a re-run with the addon at 1.0.4 changes nothing under the addon and never reads the source' -Skip:$script:godotRunning {
+        Invoke-Prepare -Root $script:tmp | Out-Null
+        $dir = Join-Path $script:tmp 'addons/godot_mcp_toolkit'
+        $dir | Should -Exist
+        $before = Get-TreeSnapshot $dir
+        Start-Sleep -Milliseconds 1100
+        $r = Invoke-Prepare -Root $script:tmp -AddonSource (Join-Path $script:tmp 'no-such-source.zip')
+        $r.ExitCode | Should -Be 0
+        Get-TreeSnapshot $dir | Should -Be $before
+    }
+
+    It 'A2 (content): a same-version zip with different content does not overwrite' -Skip:$script:godotRunning {
+        Invoke-Prepare -Root $script:tmp | Out-Null
+        $dir = Join-Path $script:tmp 'addons/godot_mcp_toolkit'
+        $before = Get-TreeSnapshot $dir
+        Start-Sleep -Milliseconds 1100
+        $other = New-FixtureAddonZip -Version '1.0.4' -GdContent '# different content'
+        (Invoke-Prepare -Root $script:tmp -AddonSource $other).ExitCode | Should -Be 0
+        Get-TreeSnapshot $dir | Should -Be $before
+    }
+
+    # A3 - the default path (not just Enable-GodotAddon) must not edit project.godot under a running editor.
+    It 'A3: while a godot process runs, files are installed but project.godot stays byte-identical, with a warning' {
+        . $script:scriptPath -RepoRoot $script:tmp
+        Mock Get-Process { [pscustomobject]@{ Name = 'godot'; Id = 4242 } }
+        $pgPath = Join-Path $script:tmp 'project.godot'
+        $before = [System.IO.File]::ReadAllBytes($pgPath)
+        Initialize-GodotAddon -RepoRoot $script:tmp -Source $script:zip104 -WarningVariable w -WarningAction SilentlyContinue | Out-Null
+        [System.IO.File]::ReadAllBytes($pgPath) | Should -Be $before
+        $w | Should -Not -BeNullOrEmpty
+        (Join-Path $script:tmp 'addons/godot_mcp_toolkit/plugin.cfg') | Should -Exist
+    }
+
+    # A4 - decision (plan-critic misread::F1): an addon at another version is never overwritten,
+    # and it is NOT enabled either: enabling a version that does not match the pinned bridge is
+    # the ticket's most common setup mistake. The user deletes the folder and re-runs to replace it.
+    It 'A4: an addon at another version is left untouched, warned about (both versions named) and not enabled' {
+        . $script:scriptPath -RepoRoot $script:tmp
+        Mock Get-Process { $null }
+        $old = New-FixtureAddonZip -Version '1.0.3'
+        $dir = Join-Path $script:tmp 'addons/godot_mcp_toolkit'
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dir) | Out-Null
+        Expand-Archive -LiteralPath $old -DestinationPath $script:tmp
+        $dir | Should -Exist
+        $snap = Get-TreeSnapshot $dir
+        $pgPath = Join-Path $script:tmp 'project.godot'
+        $pgBefore = [System.IO.File]::ReadAllBytes($pgPath)
+
+        Initialize-GodotAddon -RepoRoot $script:tmp -Source $script:zip104 -WarningVariable w -WarningAction SilentlyContinue | Out-Null
+
+        Get-TreeSnapshot $dir | Should -Be $snap
+        ($w -join "`n") | Should -Match '1\.0\.3'
+        ($w -join "`n") | Should -Match '1\.0\.4'
+        [System.IO.File]::ReadAllBytes($pgPath) | Should -Be $pgBefore
+    }
+
+    # A5 - a wrong archive must not install silently (it would resurface as the same ECONNREFUSED).
+    It 'A5: an archive whose plugin.cfg is not the pinned version throws and installs nothing' {
+        . $script:scriptPath -RepoRoot $script:tmp
+        $bad = New-FixtureAddonZip -Version '9.9.9'
+        { Install-GodotAddon -RepoRoot $script:tmp -Source $bad } | Should -Throw '*9.9.9*'
+        (Join-Path $script:tmp 'addons/godot_mcp_toolkit') | Should -Not -Exist
+    }
+
+    It 'A5 (missing source): a local source path that does not exist throws without installing' {
+        . $script:scriptPath -RepoRoot $script:tmp
+        { Install-GodotAddon -RepoRoot $script:tmp -Source (Join-Path $script:tmp 'nope.zip') } | Should -Throw '*not found*'
+        (Join-Path $script:tmp 'addons/godot_mcp_toolkit') | Should -Not -Exist
+    }
+}
+
 # ---------------------------------------------------------------------------
 # R6 - real editor, two environments, gui game_start. Run by hand, never in CI.
 # ---------------------------------------------------------------------------
@@ -330,6 +464,14 @@ Describe 'Live: per-environment Godot editor' -Tag Live {
         $script:liveMain = (Resolve-Path $env:GODOT_LIVE_PROJECT).Path
         $script:liveWt   = Join-Path ([System.IO.Path]::GetTempPath()) ('pgw-wt-' + [System.IO.Path]::GetRandomFileName())
         & git -C $script:liveMain worktree add --detach $script:liveWt | Out-Null
+        # Ticket #4: the worktree starts as a fresh checkout with an EMPTY addons/ (no addon,
+        # no [editor_plugins] enable entry); prepare must install (default = real release URL,
+        # network) and enable the pinned addon before the editor can boot there.
+        Remove-Item -Recurse -Force (Join-Path $script:liveWt 'addons/godot_mcp_toolkit') -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:liveWt 'addons') | Out-Null
+        $wtPg = Join-Path $script:liveWt 'project.godot'
+        [System.IO.File]::WriteAllText($wtPg, ([regex]::Replace((Get-Content -Raw $wtPg),
+            '(?m)^enabled=PackedStringArray\(.*\)[ \t]*\r?\n?', '')))
         foreach ($p in @($script:liveMain, $script:liveWt)) {
             & pwsh -NoProfile -File $script:scriptPath -RepoRoot $p | Out-Null
         }
@@ -392,6 +534,9 @@ Describe 'Live: per-environment Godot editor' -Tag Live {
     }
 
     It 'boots a headless editor in each of two checkouts and each bridge sees its own project' -Skip:(-not ($env:GODOT_EDITOR_PATH -and $env:GODOT_LIVE_PROJECT)) {
+        # The fresh worktree got its addon from prepare, not from the checkout.
+        (Get-Content -Raw (Join-Path $script:liveWt 'addons/godot_mcp_toolkit/plugin.cfg')) | Should -Match '(?m)^version="1\.0\.4"'
+        (Get-Content -Raw (Join-Path $script:liveWt 'project.godot')) | Should -Match 'res://addons/godot_mcp_toolkit/plugin\.cfg'
         foreach ($p in @($script:liveMain, $script:liveWt)) {
             $r = Invoke-LiveStep -Checkout $p -StepName 'default' -Section 'Start'
             $r.ExitCode | Should -Be 0
