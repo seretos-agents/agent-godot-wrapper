@@ -10,7 +10,7 @@ name: release
 #      GitHub Release whose notes are generated from main's history (via
 #      src/<TAG> marker tags -- see AGENTS.md) with the zip attached.
 #   3. The workflow then notifies agent-marketplace directly via
-#      MARKETPLACE_DISPATCH_TOKEN, forwarding the same notes as `changelog`.
+#      ECOSYSTEM_TOKEN, forwarding the same notes as `changelog`.
 on:
   workflow_dispatch:
     inputs:
@@ -223,7 +223,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          GH_PAT:  ${{ secrets.ECOSYSTEM_TOKEN }}
           VERSION: ${{ inputs.version }}
         run: |
           DESC=$(jq -r '.description' .claude-plugin/plugin.json)
