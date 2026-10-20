@@ -1,0 +1,21 @@
+{
+  "name": "agent-godot-wrapper",
+  "description": "Pairs the external Godot MCP Toolkit bridge with a skill so Claude can drive the Godot 4 editor - inspecting scenes, nodes, scripts and resources, running playtests - through structured MCP operations instead of guessing project state.",
+  "version": "0.0.1",
+  "author": {
+    "name": "Arne von Appen"
+  },
+  "dependencies": [],
+  "mcpServers": {
+    "godotMCP": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@npgamedev/godot-mcp-server@1.0.4"
+      ],
+      "env": {
+        "GODOT_MCP_PROJECT_PATH": "${CLAUDE_PROJECT_DIR}"
+      }
+    }
+  }
+}
