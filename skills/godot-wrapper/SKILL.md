@@ -247,9 +247,10 @@ headless, so the whole node/signal chain does). What degrades, with a clear erro
 Readiness signal: the editor's Output log prints `[MCPServer] listening on
 127.0.0.1:<port>` once the addon is up. Until then, calls fail as in Pitfall 1.
 
-**Fresh, never-opened project:** the addon can be enabled without the UI by adding
-`[editor_plugins] enabled=PackedStringArray("res://addons/godot_mcp_toolkit/plugin.cfg")`
-to `project.godot` — only while **no** editor has the project open.
+**Enabling the addon without the UI:** the enable entry in `project.godot` is
+`[editor_plugins] enabled=PackedStringArray("res://addons/godot_mcp_toolkit/plugin.cfg")`.
+`scripts/prepare-godot-worktree.ps1` (below) writes it for you; adding it by hand is the
+fallback. Either way, edit `project.godot` only while **no** editor has the project open.
 
 **Other editor-binary runs take the runtime slot.** Any run of the project with the
 editor binary other than `--check-only` — including a headless `--script` test runner —
@@ -257,9 +258,10 @@ also starts the runtime channel. Set `GODOT_MCP_RUNTIME=0` on such runs so they 
 steal the runtime slot from the game the agent started.
 
 **Per-environment boot (`agent-worktree`).** Run `scripts/prepare-godot-worktree.ps1`
-(from this plugin) once at the root of the Godot project repo and commit the result. It
-writes `.seretos/worktree-setup.yml` (only if absent; never rewritten) with `isolation:
-full`, two `start:` variants and one `stop:` step, plus a generated, always-overwritten
+(from this plugin) once at the root of the Godot project repo (`-RepoRoot`, default the
+git toplevel) and commit the result. It installs and enables the toolkit addon, writes
+`.seretos/worktree-setup.yml` (only if absent; never rewritten) with `isolation: full`,
+two `start:` variants and one `stop:` step, plus a generated, always-overwritten
 `.seretos/godot-mcp-launch.ps1`, and adds `.godot-mcp/` to `.gitignore`. Then
 `environment_start` boots an editor for that checkout and `environment_stop` kills it:
 
@@ -272,9 +274,15 @@ full`, two `start:` variants and one `stop:` step, plus a generated, always-over
   timeout it fails and keeps `.godot-mcp/godot.pid`; call `environment_stop` to clean up.
 - A second start on a checkout whose recorded editor is alive does nothing (one editor per
   directory). Stop is a silent no-op when nothing is recorded.
-- `-EnableAddon` (opt-in) adds the addon to `project.godot`'s `[editor_plugins]` list; it
-  is skipped with a warning while any `godot*` process is running.
-- The addon itself must still be installed in the project; the script only warns if absent.
+- Addon: `addons/godot_mcp_toolkit/` is installed at `1.0.4`, the version that matches the
+  bridge, and enabled in `project.godot`'s `[editor_plugins]` list. The source is the
+  pinned GitHub release zip unless `-AddonSource` names another URL or a local zip (a
+  missing local path is an error, never a network fallback). An addon already at `1.0.4`
+  is left alone. An addon at **another** version is left untouched, warned about and
+  **not** enabled; to get `1.0.4`, delete `addons/godot_mcp_toolkit/` and re-run the
+  script. Without a `project.godot` the addon step is skipped with a warning.
+- The `project.godot` edit is skipped with a warning while any `godot*` process is
+  running; the addon files are still installed. Close the editor and re-run to enable.
 
 ### Pinning ports (parallel test harnesses only)
 
@@ -291,19 +299,34 @@ plugin's manifests set no pins on purpose; put them in the launching environment
 
 ## Pitfalls
 
-1. **Editor-side addon is a hard prerequisite — but a failed call is recoverable
-   in-session.** The Godot MCP Toolkit addon must be installed and **Active** in the
-   target project, and the editor must be open on that project, or every tool call fails
-   with a connection error. The bridge resolves the editor from the registry per connect
-   and the registry is rewritten whenever an editor (re)starts, so: open the editor (or
-   wait for `[MCPServer] listening on 127.0.0.1:<port>`), then **retry the same call**. If
-   it still fails, reconnect the MCP server (`/mcp` → reconnect) — no session restart.
-   The tool list is a **static** server-side definition for the always-on set: seeing the
-   tools does not mean the editor is up, and a failing call does not mean the tool is
-   missing. A connection error that persists after a reconnect means the session is
-   rooted in a different path from the one the editor has open (worktree vs main checkout,
-   a `subst`/junction path) — compare `${CLAUDE_PROJECT_DIR}` with the editor's project
-   path.
+1. **A connection error has two causes — check the addon before the editor.** A tool
+   call that fails with `CONNECT_FAILED`, `ECONNREFUSED` or any "editor unreachable"
+   error means either the toolkit addon is missing from the project, or no editor with
+   the addon is listening. Without the addon no editor ever listens, so opening an
+   editor, retrying or reconnecting cannot fix it. Check in this order:
+
+   a. **Addon installed and enabled?** In the project root, check that
+      `addons/godot_mcp_toolkit/plugin.cfg` exists **and** that `project.godot`'s
+      `[editor_plugins]` `enabled` list contains
+      `"res://addons/godot_mcp_toolkit/plugin.cfg"`. If either is missing, close any Godot
+      editor on the project, then run this plugin's `scripts/prepare-godot-worktree.ps1`
+      at the repo root (`-RepoRoot <path>` if not run from inside the repo). It installs
+      the addon at `1.0.4` and enables it (see "Per-environment boot"). If it warns that
+      an addon at another version is present, the addon was left as is and not enabled:
+      delete `addons/godot_mcp_toolkit/` and run the script again. Only after the script
+      has installed and enabled the addon, go on to b.
+
+   b. **Addon present and enabled — the editor is down or not found.** The bridge
+      resolves the editor from the registry per connect, and the registry is rewritten
+      whenever an editor (re)starts, so a failed call is recoverable in-session: open the
+      editor on the project (or wait for `[MCPServer] listening on 127.0.0.1:<port>`),
+      then **retry the same call**. If it still fails, reconnect the MCP server (`/mcp` →
+      reconnect) — no session restart. The tool list is a **static** server-side
+      definition for the always-on set: seeing the tools does not mean the editor is up,
+      and a failing call does not mean the tool is missing. A connection error that
+      persists after a reconnect means the session is rooted in a different path from the
+      one the editor has open (worktree vs main checkout, a `subst`/junction path) —
+      compare `${CLAUDE_PROJECT_DIR}` with the editor's project path.
 
 2. **Editor channel vs runtime channel.** `node_*` / `scene_*` / `signal_manage` act on
    the edited scene and are saved to disk; `runtime_*` / `input_simulate` act on the
