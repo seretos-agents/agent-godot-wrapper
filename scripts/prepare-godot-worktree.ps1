@@ -221,7 +221,11 @@ $launchScript = @'
   Start: & godot-mcp-launch.ps1 -Variant <default|gui> -CheckoutPath <path>
     default = `godot --headless --editor` (CI / unattended; no screenshots or playtests)
     gui     = windowed `godot --editor` (needs a display)
-  Editor binary: $env:GODOT_EDITOR_PATH, else `godot` / `godot4` on PATH.
+  Editor binary, first match wins: $env:GODOT_PATH, $env:GODOT_EDITOR_PATH (both must
+  name an existing file, else the step fails naming the variable), `godot` / `godot4`
+  on PATH, else a pinned Godot 4.7.2-stable Windows console build provisioned once into
+  %LOCALAPPDATA%\agent-godot-wrapper\godot\4.7.2-stable\ and reused afterwards.
+  Set GODOT_PATH to use your own editor instead. Provisioning is Windows-only.
   Readiness: waits up to -WaitSeconds for the editor log to print
   `[MCPServer] listening on 127.0.0.1:<port>`, or (Windows) for a fresh entry for this
   checkout in %APPDATA%\godot-mcp-toolkit\projects.json (an entry that already existed
@@ -244,6 +248,11 @@ $ErrorActionPreference = 'Stop'
 # PowerShell 5.1 does not define $IsWindows; treat its absence as Windows.
 $script:OnWindows = if ($null -ne $IsWindows) { $IsWindows } else { $true }
 
+# Pinned editor build provisioned when nothing else resolves.
+$script:GodotVersion = '4.7.2-stable'
+$script:GodotExe = "Godot_v$($script:GodotVersion)_win64_console.exe"
+$script:GodotUrl = "https://github.com/godotengine/godot-builds/releases/download/$($script:GodotVersion)/Godot_v$($script:GodotVersion)_win64.exe.zip"
+
 function Get-GodotLaunchArgs {
     param(
         [ValidateSet('default', 'gui')][string]$Variant = 'default',
@@ -257,13 +266,75 @@ function Get-GodotLaunchArgs {
     return $a
 }
 
+function Get-GodotInstallDir {
+    $base = $env:LOCALAPPDATA
+    if (-not $base) { throw "LOCALAPPDATA is not set; cannot locate the Godot install directory. Set GODOT_PATH to the editor executable." }
+    return (Join-Path $base "agent-godot-wrapper/godot/$($script:GodotVersion)")
+}
+
+# Installs the pinned console build into Get-GodotInstallDir and returns the exe path.
+# An existing install is returned untouched (source never resolved).
+function Install-GodotEditor {
+    param([Parameter(Mandatory)][string]$Source)
+    $dir = Get-GodotInstallDir
+    $exe = Join-Path $dir $script:GodotExe
+    if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
+    if (Test-Path -LiteralPath $dir) {
+        throw "Godot install directory $dir exists but lacks $($script:GodotExe); delete it and re-run."
+    }
+    $isUrl = $Source -match '^https?://'
+    if (-not $isUrl -and -not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        throw "Godot source not found: $Source"
+    }
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('agw-godot-' + [System.IO.Path]::GetRandomFileName())
+    $staging = "$dir.partial-" + [System.IO.Path]::GetRandomFileName()
+    try {
+        New-Item -ItemType Directory -Force -Path $work | Out-Null
+        $zip = $Source
+        if ($isUrl) {
+            $zip = Join-Path $work 'godot.zip'
+            Write-Host "godot-mcp-launch: downloading Godot $($script:GodotVersion) from $Source"
+            $pp = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            try { Invoke-WebRequest -UseBasicParsing -Uri $Source -OutFile $zip } finally { $ProgressPreference = $pp }
+        }
+        $ex = Join-Path $work 'x'
+        Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force
+        $found = @(Get-ChildItem -LiteralPath $ex -Recurse -File -Filter $script:GodotExe)
+        if ($found.Count -ne 1) {
+            throw "Godot archive must contain exactly one $($script:GodotExe) (the $($script:GodotVersion) console build); found $($found.Count)."
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dir) | Out-Null
+        Copy-Item -LiteralPath $found[0].Directory.FullName -Destination $staging -Recurse
+        try { Move-Item -LiteralPath $staging -Destination $dir -ErrorAction Stop }
+        catch {
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw }
+        }
+        Write-Host "godot-mcp-launch: Provisioned Godot $($script:GodotVersion) into $dir"
+        return $exe
+    } finally {
+        Remove-Item -Recurse -Force -LiteralPath $work, $staging -ErrorAction SilentlyContinue
+    }
+}
+
+# Precedence: GODOT_PATH > GODOT_EDITOR_PATH > godot/godot4 on PATH > provisioned build.
 function Resolve-GodotBinary {
-    if ($env:GODOT_EDITOR_PATH) { return $env:GODOT_EDITOR_PATH }
+    param([string]$Source = $script:GodotUrl)
+    foreach ($v in @('GODOT_PATH', 'GODOT_EDITOR_PATH')) {
+        $val = [Environment]::GetEnvironmentVariable($v)
+        if ($val) {
+            if (-not (Test-Path -LiteralPath $val -PathType Leaf)) { throw "$v is set to '$val', which is not an existing file." }
+            return $val
+        }
+    }
     foreach ($n in @('godot', 'godot4')) {
         $c = Get-Command $n -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($c) { return $c.Source }
     }
-    throw "No Godot editor binary found: set GODOT_EDITOR_PATH to the editor executable (or put 'godot' / 'godot4' on PATH)."
+    if (-not $script:OnWindows) {
+        throw "No Godot editor binary found: automatic provisioning is Windows-only; set GODOT_PATH to the editor executable (or put 'godot' / 'godot4' on PATH)."
+    }
+    return (Install-GodotEditor -Source $Source)
 }
 
 function Read-SharedText {
@@ -329,6 +400,7 @@ function Start-GodotEditor {
     }
 
     $bin = Resolve-GodotBinary
+    Write-Host "godot-mcp-launch: Godot editor $bin"
     $before = Get-RegistryEntry $CheckoutPath
     Remove-Item -Force $logFile -ErrorAction SilentlyContinue
 
