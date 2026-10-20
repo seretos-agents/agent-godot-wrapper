@@ -33,7 +33,7 @@ Godot 4.5+ is recommended; C# projects need the mono (.NET) editor build. Commit
 
 Start Claude Code from the Godot project root (or a linked worktree of it) with the editor open on that same project. The bridge finds the editor through the toolkit's machine-wide registry, keyed by project path — no port or token to configure.
 
-Optional: to let `agent-worktree` boot a per-checkout editor (`environment_start`), run `pwsh scripts/prepare-godot-worktree.ps1` from this plugin once at your Godot repo root (it also installs and enables the addon; the `project.godot` edit is skipped while a Godot editor is running) and commit the result; set `GODOT_EDITOR_PATH` to your editor binary (or put `godot` on `PATH`). See `skills/godot-wrapper/SKILL.md`.
+Optional: to let `agent-worktree` boot a per-checkout editor (`environment_start`), run `pwsh scripts/prepare-godot-worktree.ps1` from this plugin once at your Godot repo root (it also installs and enables the addon; the `project.godot` edit is skipped while a Godot editor is running) and commit the result; no editor setup is needed: with no `GODOT_PATH`/`GODOT_EDITOR_PATH` and no `godot` on `PATH`, the first start downloads the pinned Godot 4.7.2-stable Windows console build into `%LOCALAPPDATA%\agent-godot-wrapper\godot\4.7.2-stable` and reuses it afterwards (Windows only). `GODOT_PATH` is an optional override that always wins. See `skills/godot-wrapper/SKILL.md`.
 
 ## What the skill teaches
 

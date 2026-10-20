@@ -455,6 +455,198 @@ Describe 'prepare-godot-worktree.ps1 A: addon install (ticket #4)' {
 }
 
 # ---------------------------------------------------------------------------
+# G - Godot binary provisioning (ticket #3). The generated launcher resolves the
+# editor as GODOT_PATH > GODOT_EDITOR_PATH > godot/godot4 on PATH > a provisioned
+# pinned 4.7.2-stable console build under %LOCALAPPDATA%. No test touches the network:
+# $script:GodotUrl is pointed at a local stand-in zip.
+# ---------------------------------------------------------------------------
+Describe 'prepare-godot-worktree.ps1 G: Godot binary provisioning (ticket #3)' {
+    BeforeAll {
+        $script:godotConsole = 'Godot_v4.7.2-stable_win64_console.exe'
+        $script:godotGui     = 'Godot_v4.7.2-stable_win64.exe'
+
+        # Stand-in release archive: dummy GUI + console exes (console omitted with -NoConsole).
+        function New-FixtureGodotZip {
+            param([switch]$NoConsole)
+            $base = Join-Path ([System.IO.Path]::GetTempPath()) ('pgw-gzip-' + [System.IO.Path]::GetRandomFileName())
+            $tree = Join-Path $base 'tree'
+            New-Item -ItemType Directory -Force -Path $tree | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $tree $script:godotGui), 'stand-in gui')
+            if (-not $NoConsole) { [System.IO.File]::WriteAllText((Join-Path $tree $script:godotConsole), 'stand-in console') }
+            $zip = Join-Path $base 'godot.zip'
+            Compress-Archive -Path (Join-Path $tree '*') -DestinationPath $zip
+            return $zip
+        }
+    }
+
+    BeforeEach {
+        $script:tmp = New-TempGodotRepo
+        (Invoke-Prepare -Root $script:tmp).ExitCode | Should -Be 0
+        $script:savedEnv = @{
+            LOCALAPPDATA      = $env:LOCALAPPDATA
+            GODOT_PATH        = $env:GODOT_PATH
+            GODOT_EDITOR_PATH = $env:GODOT_EDITOR_PATH
+        }
+        $script:fakeLocal = Join-Path ([System.IO.Path]::GetTempPath()) ('pgw-local-' + [System.IO.Path]::GetRandomFileName())
+        New-Item -ItemType Directory -Path $script:fakeLocal | Out-Null
+        $env:LOCALAPPDATA = $script:fakeLocal
+        $env:GODOT_PATH = $null
+        $env:GODOT_EDITOR_PATH = $null
+        # Documented install location; computed here (not via the launcher) so the tests pin it.
+        $script:installDir = Join-Path $script:fakeLocal 'agent-godot-wrapper/godot/4.7.2-stable'
+        . (Join-Path $script:tmp '.seretos/godot-mcp-launch.ps1') -CheckoutPath $script:tmp
+        $script:OnWindows = $true
+        Mock Get-Command { $null } -ParameterFilter { $Name -in 'godot', 'godot4' }
+        $script:zipOk = New-FixtureGodotZip
+    }
+    AfterEach {
+        $env:LOCALAPPDATA      = $script:savedEnv.LOCALAPPDATA
+        $env:GODOT_PATH        = $script:savedEnv.GODOT_PATH
+        $env:GODOT_EDITOR_PATH = $script:savedEnv.GODOT_EDITOR_PATH
+        Remove-Item -Recurse -Force $script:tmp, $script:fakeLocal -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force (Split-Path -Parent $script:zipOk) -ErrorAction SilentlyContinue
+    }
+
+    # G1 - symptom: "No Godot editor binary found" when nothing is configured.
+    It 'G1: with GODOT_PATH, GODOT_EDITOR_PATH and PATH all unset, resolution installs the console build and returns it' {
+        $script:GodotUrl = $script:zipOk
+        $bin = Resolve-GodotBinary
+        $bin | Should -Be (Join-Path $script:installDir $script:godotConsole)
+        $bin | Should -Exist
+        $bin | Should -BeLike "$($script:fakeLocal)*"
+    }
+
+    It 'G1b: an archive without the console exe throws and leaves no install dir' {
+        $script:GodotUrl = New-FixtureGodotZip -NoConsole
+        { Resolve-GodotBinary } | Should -Throw '*console*'
+        $script:installDir | Should -Not -Exist
+    }
+
+    It 'G1c: a missing local source throws "not found" and installs nothing' {
+        $script:GodotUrl = Join-Path $script:fakeLocal 'no-such.zip'
+        { Resolve-GodotBinary } | Should -Throw '*not found*'
+        $script:installDir | Should -Not -Exist
+    }
+
+    # G2 - a second resolution downloads/copies nothing.
+    It 'G2: a second resolution reuses the install, never reading the source' {
+        $script:GodotUrl = $script:zipOk
+        $first = Resolve-GodotBinary
+        $first | Should -Exist
+        $before = Get-TreeSnapshot $script:installDir
+        Start-Sleep -Milliseconds 1100
+        $script:GodotUrl = Join-Path $script:fakeLocal 'no-such.zip'
+        $second = Resolve-GodotBinary
+        $second | Should -Be $first
+        Get-TreeSnapshot $script:installDir | Should -Be $before
+    }
+
+    # G3 - an explicit GODOT_PATH wins over everything, with no download.
+    It 'G3: GODOT_PATH pointing at an existing file wins over GODOT_EDITOR_PATH and installs nothing' {
+        $p = Join-Path $script:fakeLocal 'my-godot.exe'
+        $e = Join-Path $script:fakeLocal 'editor-godot.exe'
+        [System.IO.File]::WriteAllText($p, 'x'); [System.IO.File]::WriteAllText($e, 'x')
+        $env:GODOT_PATH = $p
+        $env:GODOT_EDITOR_PATH = $e
+        $script:GodotUrl = Join-Path $script:fakeLocal 'no-such.zip'
+        Resolve-GodotBinary | Should -Be $p
+        $script:installDir | Should -Not -Exist
+    }
+
+    It 'G3b: GODOT_PATH pointing at a nonexistent file throws naming the variable, never downloads' {
+        $env:GODOT_PATH = Join-Path $script:fakeLocal 'missing.exe'
+        $script:GodotUrl = $script:zipOk
+        { Resolve-GodotBinary } | Should -Throw '*GODOT_PATH*'
+        $script:installDir | Should -Not -Exist
+    }
+
+    # G4 - provisioning is Windows-only; elsewhere fail clearly instead of installing an unrunnable exe.
+    It 'G4: off Windows with no binary, resolution throws naming GODOT_PATH and installs nothing' {
+        $script:OnWindows = $false
+        $script:GodotUrl = $script:zipOk
+        { Resolve-GodotBinary } | Should -Throw '*GODOT_PATH*'
+        $script:installDir | Should -Not -Exist
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Live (ticket #3) - environment_start on a prepared checkout with NO binary configured:
+# the launcher downloads the real pinned build. Run by hand, never in CI:
+#   $env:GODOT_LIVE_PROJECT = '<a git repo with a Godot project>'
+#   pwsh -NoProfile -Command "Invoke-Pester -Path tests/prepare-godot-worktree.Tests.ps1 -TagFilter Live -Output Detailed"
+# ---------------------------------------------------------------------------
+Describe 'Live: provisioned editor (ticket #3)' -Tag Live {
+    BeforeAll {
+        $script:provReady = [bool]$env:GODOT_LIVE_PROJECT
+        if (-not $script:provReady) { return }
+        $script:provSaved = @{ GODOT_PATH = $env:GODOT_PATH; GODOT_EDITOR_PATH = $env:GODOT_EDITOR_PATH; PATH = $env:PATH }
+        $env:GODOT_PATH = $null
+        $env:GODOT_EDITOR_PATH = $null
+        $sep = [System.IO.Path]::PathSeparator
+        $env:PATH = (($env:PATH -split [regex]::Escape($sep)) | Where-Object { $_ -and $_ -notmatch 'godot' }) -join $sep
+        $script:provMain = (Resolve-Path $env:GODOT_LIVE_PROJECT).Path
+        $script:provWt   = Join-Path ([System.IO.Path]::GetTempPath()) ('pgw-prov-' + [System.IO.Path]::GetRandomFileName())
+        & git -C $script:provMain worktree add --detach $script:provWt | Out-Null
+        & pwsh -NoProfile -File $script:scriptPath -RepoRoot $script:provWt | Out-Null
+
+        function Invoke-LiveStep {
+            param([string]$Checkout, [string]$StepName, [string]$Section)
+            $yml = Get-Content -Raw (Join-Path $Checkout '.seretos/worktree-setup.yml')
+            $s = Get-YmlSections $yml
+            $body = Get-RunBody $s[$Section] $StepName
+            Invoke-StepBody -Body $body -WorktreePath $Checkout
+        }
+
+        function Invoke-BridgeTool {
+            param([string]$Checkout, [string]$Tool, [hashtable]$ToolArgs = @{})
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = if ($IsWindows) { 'npx.cmd' } else { 'npx' }
+            foreach ($a in @('-y', '@npgamedev/godot-mcp-server@1.0.4')) { $psi.ArgumentList.Add($a) }
+            $psi.WorkingDirectory = $Checkout
+            $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.UseShellExecute = $false
+            $psi.Environment.Remove('GODOT_MCP_PROJECT_PATH') | Out-Null
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            try {
+                $send = {
+                    param($o) $proc.StandardInput.WriteLine(($o | ConvertTo-Json -Depth 8 -Compress)); $proc.StandardInput.Flush()
+                }
+                & $send @{ jsonrpc = '2.0'; id = 1; method = 'initialize'; params = @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'pester'; version = '0' } } }
+                $null = $proc.StandardOutput.ReadLineAsync().Wait(60000)
+                & $send @{ jsonrpc = '2.0'; method = 'notifications/initialized' }
+                & $send @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = $Tool; arguments = $ToolArgs } }
+                $deadline = (Get-Date).AddSeconds(60)
+                while ((Get-Date) -lt $deadline) {
+                    $t = $proc.StandardOutput.ReadLineAsync()
+                    if (-not $t.Wait(60000)) { break }
+                    if ($t.Result -match '"id"\s*:\s*2') { return $t.Result }
+                }
+                return $null
+            } finally { if (-not $proc.HasExited) { $proc.Kill($true) } }
+        }
+    }
+
+    AfterAll {
+        if (-not $script:provReady) { return }
+        Invoke-LiveStep -Checkout $script:provWt -StepName $null -Section 'Stop' | Out-Null
+        & git -C $script:provMain worktree remove --force $script:provWt 2>$null | Out-Null
+        $env:GODOT_PATH        = $script:provSaved.GODOT_PATH
+        $env:GODOT_EDITOR_PATH = $script:provSaved.GODOT_EDITOR_PATH
+        $env:PATH              = $script:provSaved.PATH
+    }
+
+    It 'starts the default editor with GODOT_PATH, GODOT_EDITOR_PATH and PATH all unset, and scene_get_tree works' -Skip:(-not $env:GODOT_LIVE_PROJECT) {
+        @(Get-Command godot, godot4 -CommandType Application -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty
+        $r = Invoke-LiveStep -Checkout $script:provWt -StepName 'default' -Section 'Start'
+        $r.ExitCode | Should -Be 0
+        (Get-Content -Raw (Join-Path $script:provWt '.godot-mcp/editor.log')) | Should -Match '\[MCPServer\] listening on 127\.0\.0\.1:\d+'
+        (Join-Path $env:LOCALAPPDATA 'agent-godot-wrapper/godot/4.7.2-stable/Godot_v4.7.2-stable_win64_console.exe') | Should -Exist
+        $resp = Invoke-BridgeTool -Checkout $script:provWt -Tool 'scene_get_tree'
+        $resp | Should -Match '"result"'
+        $resp | Should -Not -Match '"isError"\s*:\s*true'
+    }
+}
+
+# ---------------------------------------------------------------------------
 # R6 - real editor, two environments, gui game_start. Run by hand, never in CI.
 # ---------------------------------------------------------------------------
 Describe 'Live: per-environment Godot editor' -Tag Live {
